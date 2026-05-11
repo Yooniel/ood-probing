@@ -36,7 +36,7 @@ https://huggingface.co/datasets/Yooniel/roleplaying-interp
 
 ## Scripts
 
-### Full Linear-Probe Baseline
+### Linear-Probe Baseline
 
 Train a linear probe on the source dataset and evaluate it on
 target datasets.
@@ -47,7 +47,7 @@ python baseline_full.py \
   --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu
 ```
 
-### Target-Trained PC Ranking Baseline
+### Target-Trained Baseline
 
 Train a linear probe using target labels in source PCA basis.
 
