@@ -195,7 +195,7 @@ def main() -> None:
     parser.add_argument("--max-pcs", type=int, default=100, help="Search PCs from PC1 through this limit.")
     parser.add_argument("--target-val-size", type=float, default=0.8,
                         help="Fraction of target used for validation; rest is held-out test.")
-    parser.add_argument("--cv-folds", type=int, default=1,
+    parser.add_argument("--cv-folds", type=int, default=5,
                         help="If >1, use stratified K-fold CV on each target instead of one random split.")
     parser.add_argument(
         "--selection-scope",

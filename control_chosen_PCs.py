@@ -81,7 +81,7 @@ def main() -> None:
     parser.add_argument("--pooling", choices=["mean", "last"], default="mean",
                         help="Pooling over token activations.")
     parser.add_argument("--c", type=float, default=0.1, help="Inverse regularization strength.")
-    parser.add_argument("--max-pcs", type=int, default=32,
+    parser.add_argument("--max-pcs", type=int, default=100,
                         help="Truncate source PCA basis to this many PCs.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for probe training.")
     parser.add_argument("--output", type=Path, default=None, help="Save results to a JSON file.")

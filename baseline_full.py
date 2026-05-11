@@ -86,7 +86,7 @@ def main() -> None:
                         help="Pooling over token activations.")
     parser.add_argument("--c", type=float, default=0.1, help="Inverse regularization strength.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
-    parser.add_argument("--source-test-size", type=float, default=0.2,
+    parser.add_argument("--source-test-size", type=float, default=0.0,
                         help="Held-out fraction of source data. Set to 0.0 to train on the full source dataset.")
     parser.add_argument("--output", type=Path, default=None, help="Save results to a JSON file.")
     args = parser.parse_args()

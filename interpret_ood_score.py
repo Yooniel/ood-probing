@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("data/deception-activations"),
                         help="Directory containing activation and label .npy files.")
     parser.add_argument("--source", required=True, help="Source dataset name.")
-    parser.add_argument("--layer", type=int, required=True)
+    parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--pc", type=int, required=True, help="1-indexed principal component.")
     parser.add_argument("--tokenizer", required=True,
                         help="Tokenizer name or local path used to decode saved token ids.")
