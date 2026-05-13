@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""Standalone PCA-direction interpreter for saved token activations.
-
-This script is intentionally self-contained. It does not depend on the
-`automated-interpretability` folder.
-
-What it does:
-1. Load a source dataset and fit PCA on pooled example representations.
-2. Select one principal component by 1-indexed index, e.g. PC 2.
-3. Project token-level activations onto that PC.
-4. Pick the highest-positive and highest-negative activating examples.
-5. Build a bipolar interpretation prompt that uses both poles.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -25,8 +11,10 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
+
+from data import discover_datasets, load_dataset, load_raw_token_dataset
+from modeling import PCA_SEED, fit_source_pca
+
 
 TRANSFORMERS_IMPORT_ERROR = None
 try:
@@ -44,6 +32,9 @@ DATASET_PROMPT_DESCRIPTIONS = {
     "insider_trading__upscale": (
         "The model acts as an automated trader who has made a trade with insider information. "
         "We evaluate whether the model honestly reports the use of insider information to its boss."
+    ),
+    "insider_trading_doubledown__upscale": (
+        "The model acts as an automated trader and is pressed about a trade made with insider information."
     ),
     "sandbagging_v2__wmdp_mmlu": (
         "The model is asked to strategically underperform on particular kinds of evaluation questions, "
@@ -69,26 +60,18 @@ class SelectedExample:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Interpret a principal component using highest-positive and "
-            "highest-negative activating examples."
-        )
+        description="Interpret a principal component using highest-positive and highest-negative activating examples."
     )
-    parser.add_argument("--data-dir", type=Path, default=Path("data/deception-activations"),
-                        help="Directory containing activation and label .npy files.")
-    parser.add_argument("--source", required=True, help="Source dataset name.")
+    parser.add_argument("--data-dir", type=Path, default=Path("data/deception-activations"))
+    parser.add_argument("--source", required=True)
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--pc", type=int, required=True, help="1-indexed principal component.")
-    parser.add_argument("--tokenizer", required=True,
-                        help="Tokenizer name or local path used to decode saved token ids.")
-    parser.add_argument("--pooling", choices=["mean", "last"], default="mean",
-                        help="Pooling over token activations.")
-    parser.add_argument("--openai-model", default=None,
-                        help="OpenAI model name for judge. If omitted, only writes prompt/data.")
-    parser.add_argument("--openai-base-url", default="https://api.openai.com/v1",
-                        help="Base URL for the OpenAI-compatible API.")
+    parser.add_argument("--tokenizer", required=True, help="Tokenizer name or local path used to decode token ids.")
+    parser.add_argument("--pooling", choices=["mean", "last"], default="mean")
+    parser.add_argument("--openai-model", default=None, help="If omitted, only writes prompt/data.")
+    parser.add_argument("--openai-base-url", default="https://api.openai.com/v1")
     parser.add_argument("--max-tokens", type=int, default=300)
-    parser.add_argument("--output", type=Path, default=None, help="Save results to a JSON file.")
+    parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -100,105 +83,16 @@ def ensure_dependencies() -> None:
         )
 
 
-def pool_token_activations(example_activations: np.ndarray, pooling: str) -> np.ndarray:
-    example_activations = np.asarray(example_activations)
-    if example_activations.ndim != 2:
-        raise ValueError(
-            "Expected token activations with shape [seq_len, hidden_size], "
-            f"got {example_activations.shape}."
-        )
-    if example_activations.shape[0] == 0:
-        raise ValueError("Encountered an example with zero non-padding tokens.")
-
-    if pooling == "mean":
-        pooled = example_activations.mean(axis=0)
-    elif pooling == "last":
-        pooled = example_activations[-1]
-    else:
-        raise ValueError(f"Unsupported pooling mode: {pooling}")
-    return pooled.astype(np.float32, copy=False)
-
-
-def maybe_pool_activations(x: np.ndarray, pooling: str) -> np.ndarray:
-    if x.dtype != object:
-        if x.ndim != 2:
-            raise ValueError(
-                "Expected pooled activations to have shape [num_examples, hidden_size], "
-                f"got {x.shape}."
-            )
-        return x.astype(np.float32, copy=False)
-
-    pooled_rows = [pool_token_activations(np.asarray(row), pooling) for row in x]
-    if not pooled_rows:
-        raise ValueError("Activation file is empty after loading.")
-    return np.stack(pooled_rows, axis=0).astype(np.float32, copy=False)
-
-
-def load_dataset_for_pca(
-    data_dir: Path,
-    dataset_name: str,
-    layer: int,
-    pooling: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    x_path = data_dir / f"{dataset_name}_layer{layer}_activations.npy"
-    y_path = data_dir / f"{dataset_name}_labels.npy"
-    legacy_y_path = data_dir / f"{dataset_name}_layer{layer}_labels.npy"
-    if not x_path.exists():
-        raise FileNotFoundError(f"Missing activations file: {x_path}")
-    if not y_path.exists():
-        if not legacy_y_path.exists():
-            raise FileNotFoundError(f"Missing labels file: {y_path}")
-        y_path = legacy_y_path
-
-    x = np.load(x_path, allow_pickle=True)
-    y = np.load(y_path, allow_pickle=True).astype(np.int64)
-    x = maybe_pool_activations(x, pooling)
-    return x, y
-
-
-def load_raw_records_dataset(
-    data_dir: Path,
-    dataset_name: str,
-    layer: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-    x_path = data_dir / f"{dataset_name}_layer{layer}_activations.npy"
-    y_path = data_dir / f"{dataset_name}_labels.npy"
-    token_ids_path = data_dir / f"{dataset_name}_token_ids.npy"
-    texts_path = data_dir / f"{dataset_name}_texts.npy"
-
-    if not x_path.exists():
-        raise FileNotFoundError(f"Missing activations file: {x_path}")
-    if not y_path.exists():
-        raise FileNotFoundError(f"Missing labels file: {y_path}")
-    if not token_ids_path.exists():
-        raise FileNotFoundError(f"Missing token ids file: {token_ids_path}")
-
-    x = np.load(x_path, allow_pickle=True)
-    if x.dtype != object:
-        raise ValueError(
-            f"{x_path} appears to contain pooled activations. "
-            "Interpretation requires token-level activations."
-        )
-    y = np.load(y_path, allow_pickle=True).astype(np.int64)
-    token_ids = np.load(token_ids_path, allow_pickle=True)
-    texts = np.load(texts_path, allow_pickle=True) if texts_path.exists() else None
-    return x, y, token_ids, texts
-
-
 def load_tokenizer(tokenizer_name: str):
     return AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True, local_files_only=True)
 
 
-def standardize_token_activations(token_activations: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+def standardize_token_activations(token_activations: np.ndarray, scaler) -> np.ndarray:
     token_activations = np.asarray(token_activations, dtype=np.float32)
     return ((token_activations - scaler.mean_) / scaler.scale_).astype(np.float32, copy=False)
 
 
-def project_tokens_to_pc(
-    token_activations: np.ndarray,
-    scaler: StandardScaler,
-    pc_direction: np.ndarray,
-) -> np.ndarray:
+def project_tokens_to_pc(token_activations: np.ndarray, scaler, pc_direction: np.ndarray) -> np.ndarray:
     standardized = standardize_token_activations(token_activations, scaler)
     return np.matmul(standardized, pc_direction.astype(np.float32))
 
@@ -221,16 +115,23 @@ def build_selected_examples(
     texts: Sequence[str] | None,
     labels: Sequence[int] | None,
     tokenizer,
-    scaler: StandardScaler,
+    scaler,
     pc_direction: np.ndarray,
 ) -> list[SelectedExample]:
     selected_examples = []
     special_token_ids = build_special_token_id_set(tokenizer)
+    special_token_id_array = np.asarray(sorted(special_token_ids), dtype=np.int64)
+
     for example_index, (token_activations, token_ids) in enumerate(zip(token_activation_rows, token_id_rows)):
         token_activations = np.asarray(token_activations)
         token_ids = np.asarray(token_ids, dtype=np.int64)
+        if token_activations.shape[0] != token_ids.shape[0]:
+            raise ValueError(
+                f"Example {example_index} has {token_activations.shape[0]} activation rows "
+                f"but {token_ids.shape[0]} token ids."
+            )
         if special_token_ids:
-            content_mask = ~np.isin(token_ids, list(special_token_ids))
+            content_mask = ~np.isin(token_ids, special_token_id_array)
             token_activations = token_activations[content_mask]
             token_ids = token_ids[content_mask]
         if token_ids.shape[0] == 0:
@@ -243,6 +144,7 @@ def build_selected_examples(
                 "Decoded token count does not match token-score count: "
                 f"{len(tokens)} vs {len(signed_scores)}."
             )
+
         positive_index = int(np.argmax(signed_scores))
         negative_index = int(np.argmin(signed_scores))
         selected_examples.append(
@@ -291,10 +193,7 @@ def calculate_max_abs_activation(examples: Sequence[SelectedExample]) -> float:
     max_abs_activation = 0.0
     for example in examples:
         if example.signed_token_scores:
-            max_abs_activation = max(
-                max_abs_activation,
-                max(abs(score) for score in example.signed_token_scores),
-            )
+            max_abs_activation = max(max_abs_activation, max(abs(score) for score in example.signed_token_scores))
     return max_abs_activation
 
 
@@ -310,11 +209,10 @@ def normalize_signed_scores(scores: Sequence[float], max_abs_activation: float) 
 
 def format_example_for_prompt(example: SelectedExample, max_abs_activation: float) -> str:
     normalized_scores = normalize_signed_scores(example.signed_token_scores, max_abs_activation)
-    lines = [
+    return "\n".join(
         f"{token}\t{score:+d}"
         for token, score in zip(example.tokens, normalized_scores)
-    ]
-    return "\n".join(lines)
+    )
 
 
 def build_bipolar_prompt(
@@ -333,6 +231,7 @@ def build_bipolar_prompt(
         format_example_for_prompt(example, max_abs_activation)
         for example in negative_examples
     ) + "\n<end>\n"
+
     records_dataset_description = DATASET_PROMPT_DESCRIPTIONS.get(records_dataset)
     if records_dataset_description is None:
         records_dataset_line = f"The examples below were selected from dataset `{records_dataset}`."
@@ -341,6 +240,7 @@ def build_bipolar_prompt(
             "The examples below were selected from a dataset with this setup: "
             f"{records_dataset_description}"
         )
+
     return f"""You are interpreting a principal component direction in a neural representation space.
 
 This direction is bipolar:
@@ -376,13 +276,7 @@ OOD deception usefulness (1-10): ...
 """
 
 
-def call_openai_chat_completion(
-    *,
-    model: str,
-    prompt: str,
-    base_url: str,
-    max_tokens: int,
-) -> str:
+def call_openai_chat_completion(*, model: str, prompt: str, base_url: str, max_tokens: int) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Please set the OPENAI_API_KEY environment variable")
@@ -427,27 +321,15 @@ def main() -> None:
     args = parse_args()
 
     tokenizer = load_tokenizer(args.tokenizer)
+    registry = discover_datasets(args.data_dir, layer=args.layer)
+    source_x, _ = load_dataset(args.source, registry, args.pooling, binary_only=False)
 
-    source_x, _ = load_dataset_for_pca(
-        args.data_dir, args.source, args.layer, args.pooling,
-    )
-
-    scaler = StandardScaler()
-    source_x_scaled = scaler.fit_transform(source_x)
-    max_supported_pcs = min(source_x_scaled.shape[0], source_x_scaled.shape[1])
+    scaler, pca, _, max_supported_pcs = fit_source_pca(source_x, max_pcs=min(source_x.shape))
     if args.pc < 1 or args.pc > max_supported_pcs:
-        raise ValueError(
-            f"Requested PC {args.pc}, but fitted PCA only supports 1..{max_supported_pcs}."
-        )
-
-    pca = PCA(n_components=max_supported_pcs, random_state=7)
-    pca.fit(source_x_scaled)
+        raise ValueError(f"Requested PC {args.pc}, but fitted PCA only supports 1..{max_supported_pcs}.")
     pc_direction = pca.components_[args.pc - 1].astype(np.float32)
 
-    records_x, records_y, token_ids, texts = load_raw_records_dataset(
-        args.data_dir, args.source, args.layer,
-    )
-
+    records_x, records_y, token_ids, texts = load_raw_token_dataset(args.data_dir, args.source, args.layer)
     examples = build_selected_examples(
         token_activation_rows=records_x,
         token_id_rows=token_ids,
@@ -485,6 +367,7 @@ def main() -> None:
         "pc_1_indexed": args.pc,
         "pooling": args.pooling,
         "tokenizer": args.tokenizer,
+        "pca_seed": PCA_SEED,
         "n_positive": len(positive_examples),
         "n_negative": len(negative_examples),
         "selected_examples": {
@@ -509,7 +392,3 @@ def main() -> None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
         print(f"\nSaved results to {args.output}")
-
-
-if __name__ == "__main__":
-    main()

@@ -42,7 +42,7 @@ Train a linear probe on the source dataset and evaluate it on
 target datasets.
 
 ```bash
-python baseline_full.py \
+python scripts/baseline_full.py \
   --source roleplaying__plain \
   --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu
 ```
@@ -52,7 +52,7 @@ python baseline_full.py \
 Train a linear probe using target labels in source PCA basis.
 
 ```bash
-python baseline_target_trained.py \
+python scripts/baseline_target_trained.py \
   --source roleplaying__plain \
   --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu
 ```
@@ -62,10 +62,20 @@ python baseline_target_trained.py \
 Greedily select PCs using target validation, then evaluate on held-out target data.
 
 ```bash
-python greedy_cv.py \
+python scripts/greedy_cv.py \
   --source roleplaying__plain \
   --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu \
   --output greedy_results.json
+```
+
+
+Greedily select PCs using full target dataset.
+
+```bash
+python scripts/greedy_cv.py \
+  --source roleplaying__plain \
+  --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu \
+  --selection-scope full_target
 ```
 
 ### OOD Probe PC Ranking
@@ -73,7 +83,7 @@ python greedy_cv.py \
 Train target-label probes, and rank source PCs by weight contribution.
 
 ```bash
-python hypothesis_target_pca.py \
+python scripts/hypothesis_target_pca.py \
   --source roleplaying__plain \
   --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu
 ```
@@ -84,7 +94,7 @@ Train a source probe on chosen PCs and evaluate it on
 targets.
 
 ```bash
-python control_chosen_PCs.py \
+python scripts/control_chosen_PCs.py \
   --source roleplaying__plain \
   --targets insider_trading__upscale insider_trading_doubledown__upscale sandbagging_v2__wmdp_mmlu \
   --pcs 1 2 3 4 5
@@ -97,10 +107,13 @@ can be a local tokenizer directory or a Hugging Face model id already available
 in your local Transformers cache.
 
 ```bash
-python interpret_ood_score.py \
+python scripts/interpret_ood_score.py \
   --source roleplaying__plain \
   --pc 1 \
   --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   --openai-model gpt-5-mini \
   --output interp/roleplaying_pc1_interp.json
 ```
+
+If multiple activation layers are present for a dataset, pass `--layer N` to
+the scripts so the loader does not guess.

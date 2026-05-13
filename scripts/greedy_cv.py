@@ -1,83 +1,31 @@
+from __future__ import annotations
+
 import argparse
 import json
-import re
 from pathlib import Path
 
 import numpy as np
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import StandardScaler
 
+from _path import add_src_to_path
 
-ACTIVATION_RE = re.compile(r"^(?P<name>.+)_layer\d+_activations\.npy$")
-LABEL_RE = re.compile(r"^(?P<name>.+)_labels\.npy$")
+add_src_to_path()
 
-
-def discover_datasets(data_dir: Path) -> dict[str, dict[str, Path]]:
-    """Scan data_dir for paired *_activations.npy and *_labels.npy files."""
-    datasets: dict[str, dict[str, Path]] = {}
-    for path in sorted(data_dir.glob("*.npy")):
-        m = ACTIVATION_RE.match(path.name)
-        if m:
-            datasets.setdefault(m.group("name"), {})["activations"] = path
-            continue
-        m = LABEL_RE.match(path.name)
-        if m:
-            datasets.setdefault(m.group("name"), {})["labels"] = path
-
-    return {
-        name: paths
-        for name, paths in datasets.items()
-        if "activations" in paths and "labels" in paths
-    }
-
-
-def pool_activation(sample: np.ndarray, pooling: str) -> np.ndarray:
-    """Reduce a (tokens, hidden_dim) activation to (hidden_dim,)."""
-    array = np.asarray(sample, dtype=np.float32)
-    if pooling == "last":
-        return array[-1]
-    return array.mean(axis=0)
-
-
-def load_dataset(name: str, registry: dict[str, dict[str, Path]], pooling: str):
-    """Load and pool activations, keeping only binary (0/1) labels."""
-    labels = np.load(registry[name]["labels"], allow_pickle=True)
-    activations = np.load(registry[name]["activations"], allow_pickle=True)
-
-    keep = np.isin(labels, [0, 1])
-    labels = labels[keep].astype(np.int64)
-    activations = activations[keep]
-
-    features = np.stack([pool_activation(s, pooling) for s in activations])
-    return features, labels
-
-
-def compute_auroc(model: LogisticRegression, features: np.ndarray, labels: np.ndarray) -> float:
-    if np.unique(labels).size < 2:
-        return float("nan")
-    return float(roc_auc_score(labels, model.decision_function(features)))
-
-
-def train_probe(features: np.ndarray, labels: np.ndarray, c_value: float, seed: int) -> LogisticRegression:
-    probe = LogisticRegression(C=c_value, solver="lbfgs", max_iter=2000, random_state=seed)
-    probe.fit(features, labels)
-    return probe
+from data import dedupe_preserving_order, discover_datasets, load_dataset
+from modeling import compute_auroc, fit_source_pca, train_probe
+from validation import validate_cv_folds, validate_fraction
 
 
 def greedy_select_pcs(
-    source_pcs: np.ndarray,
-    source_labels: np.ndarray,
-    target_val_pcs: np.ndarray,
-    target_val_labels: np.ndarray,
+    source_pcs,
+    source_labels,
+    target_val_pcs,
+    target_val_labels,
     c_value: float,
     seed: int,
     max_pcs: int,
     improvement_threshold: float,
 ):
-    """Greedily add PCs that maximize target validation AUROC."""
     selected: list[int] = []
     remaining = list(range(max_pcs))
     history: list[tuple[int, float]] = []
@@ -91,7 +39,6 @@ def greedy_select_pcs(
             candidate_set = selected + [candidate_pc]
             probe = train_probe(source_pcs[:, candidate_set], source_labels, c_value, seed)
             candidate_score = compute_auroc(probe, target_val_pcs[:, candidate_set], target_val_labels)
-
             if np.isnan(candidate_score):
                 continue
             if best_score is None or candidate_score > best_score:
@@ -112,20 +59,12 @@ def greedy_select_pcs(
 
 
 def selection_label(selection_scope: str) -> str:
-    if selection_scope == "full_target":
-        return "full_target"
-    return "validation"
+    return "full_target" if selection_scope == "full_target" else "validation"
 
 
-def build_target_splits(
-    features: np.ndarray,
-    labels: np.ndarray,
-    target_val_size: float,
-    seed: int,
-    cv_folds: int,
-):
-    """Build either a single val/test split or stratified CV folds for a target dataset."""
+def build_target_splits(features, labels, target_val_size: float, seed: int, cv_folds: int, dataset_name: str):
     if cv_folds <= 1:
+        validate_fraction(target_val_size, "--target-val-size", allow_zero=True, allow_one=True)
         if target_val_size == 0.0:
             return [{
                 "fold": 1,
@@ -149,79 +88,55 @@ def build_target_splits(
             random_state=seed,
             stratify=labels,
         )
-        return [{
-            "fold": 1,
-            "val_x": val_x,
-            "test_x": test_x,
-            "val_y": val_y,
-            "test_y": test_y,
-        }]
+        return [{"fold": 1, "val_x": val_x, "test_x": test_x, "val_y": val_y, "test_y": test_y}]
 
-    class_counts = np.bincount(labels)
-    nonzero_class_counts = class_counts[class_counts > 0]
-    if nonzero_class_counts.size < 2:
-        raise ValueError("Need both classes present to build stratified CV folds.")
-    if np.min(nonzero_class_counts) < cv_folds:
-        raise ValueError(
-            f"Cannot run {cv_folds}-fold stratified CV: smallest class has only {int(np.min(nonzero_class_counts))} samples."
-        )
-
+    validate_cv_folds(labels, cv_folds, dataset_name)
     splitter = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
-    splits = []
-    for fold_idx, (val_idx, test_idx) in enumerate(splitter.split(features, labels), start=1):
-        splits.append({
+    return [
+        {
             "fold": fold_idx,
             "val_x": features[val_idx],
             "test_x": features[test_idx],
             "val_y": labels[val_idx],
             "test_y": labels[test_idx],
-        })
-    return splits
+        }
+        for fold_idx, (val_idx, test_idx) in enumerate(splitter.split(features, labels), start=1)
+    ]
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fit PCA on a source dataset, greedily select PCs using target validation AUROC, "
-                    "then evaluate the final probe on held-out target test data."
+        description="Greedily select PCs using target validation AUROC, then evaluate held-out target AUROC."
     )
-    parser.add_argument("--data-dir", type=Path, default=Path("data/deception-activations"),
-                        help="Directory containing activation and label .npy files.")
-    parser.add_argument("--source", required=True, help="Source dataset name.")
-    parser.add_argument("--targets", nargs="+", required=True, help="One or more target dataset names.")
-    parser.add_argument("--pooling", choices=["mean", "last"], default="mean",
-                        help="Pooling over token activations.")
-    parser.add_argument("--c", type=float, default=0.1, help="Inverse regularization strength.")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed.")
-    parser.add_argument("--max-pcs", type=int, default=100, help="Search PCs from PC1 through this limit.")
-    parser.add_argument("--target-val-size", type=float, default=0.8,
-                        help="Fraction of target used for validation; rest is held-out test.")
-    parser.add_argument("--cv-folds", type=int, default=5,
-                        help="If >1, use stratified K-fold CV on each target instead of one random split.")
+    parser.add_argument("--data-dir", type=Path, default=Path("data/deception-activations"))
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--targets", nargs="+", required=True)
+    parser.add_argument("--layer", type=int, default=None, help="Activation layer to load when multiple are present.")
+    parser.add_argument("--pooling", choices=["mean", "last"], default="mean")
+    parser.add_argument("--c", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--max-pcs", type=int, default=100)
+    parser.add_argument("--target-val-size", type=float, default=0.8)
+    parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument(
         "--selection-scope",
         choices=["fold_val", "full_target"],
         default="fold_val",
         help="Use fold validation data or the full target dataset to choose greedy PCs.",
     )
-    parser.add_argument("--improvement-threshold", type=float, default=0.001,
-                        help="Minimum validation AUROC improvement to keep adding PCs.")
-    parser.add_argument("--output", type=Path, default=None, help="Save results to a JSON file.")
-    args = parser.parse_args()
+    parser.add_argument("--improvement-threshold", type=float, default=0.001)
+    parser.add_argument("--output", type=Path, default=None)
+    return parser.parse_args()
 
-    registry = discover_datasets(args.data_dir)
-    target_names = list(dict.fromkeys(args.targets))
 
-    # Load source and fit PCA
+def main() -> None:
+    args = parse_args()
+    registry = discover_datasets(args.data_dir, layer=args.layer)
+    target_names = dedupe_preserving_order(args.targets)
+
     source_features, source_labels = load_dataset(args.source, registry, args.pooling)
-    max_usable_pcs = min(args.max_pcs, source_features.shape[0], source_features.shape[1])
+    scaler, pca, source_pcs, max_usable_pcs = fit_source_pca(source_features, args.max_pcs)
 
-    scaler = StandardScaler()
-    source_scaled = scaler.fit_transform(source_features)
-
-    pca = PCA(n_components=max_usable_pcs, random_state=7)
-    source_pcs = pca.fit_transform(source_scaled)
-
-    # Split each target into val / test and project into source PCA space
     target_splits = []
     for name in target_names:
         features, labels = load_dataset(name, registry, args.pooling)
@@ -232,21 +147,24 @@ def main() -> None:
             target_val_size=args.target_val_size,
             seed=args.seed,
             cv_folds=args.cv_folds,
+            dataset_name=name,
         )
         target_splits.append({
             "name": name,
             "full_target_pcs": full_target_pcs,
             "full_target_labels": labels,
-            "splits": [{
-                "fold": split["fold"],
-                "val_pcs": pca.transform(scaler.transform(split["val_x"])),
-                "test_pcs": pca.transform(scaler.transform(split["test_x"])),
-                "val_labels": split["val_y"],
-                "test_labels": split["test_y"],
-            } for split in splits],
+            "splits": [
+                {
+                    "fold": split["fold"],
+                    "val_pcs": pca.transform(scaler.transform(split["val_x"])),
+                    "test_pcs": pca.transform(scaler.transform(split["test_x"])),
+                    "val_labels": split["val_y"],
+                    "test_labels": split["test_y"],
+                }
+                for split in splits
+            ],
         })
 
-    # Print header
     print(f"source={args.source}  pooling={args.pooling}  c={args.c}  seed={args.seed}")
     print(f"selection_scope={args.selection_scope}")
     if args.cv_folds > 1:
@@ -255,22 +173,15 @@ def main() -> None:
         print(f"target_val_size={args.target_val_size}  improvement_threshold={args.improvement_threshold}")
     print(f"source_n={len(source_labels)}  max_pcs={max_usable_pcs}\n")
 
-    if args.cv_folds > 1:
-        print("target\tfold\tval_n\ttest_n")
-    else:
-        print("target\tval_n\ttest_n")
+    print("target\tfold\tval_n\ttest_n" if args.cv_folds > 1 else "target\tval_n\ttest_n")
     for split in target_splits:
-        if args.cv_folds > 1:
-            for fold_split in split["splits"]:
-                print(
-                    f"{split['name']}\t{fold_split['fold']}\t{len(fold_split['val_labels'])}\t{len(fold_split['test_labels'])}"
-                )
-        else:
-            fold_split = split["splits"][0]
-            print(f"{split['name']}\t{len(fold_split['val_labels'])}\t{len(fold_split['test_labels'])}")
+        for fold_split in split["splits"]:
+            if args.cv_folds > 1:
+                print(f"{split['name']}\t{fold_split['fold']}\t{len(fold_split['val_labels'])}\t{len(fold_split['test_labels'])}")
+            else:
+                print(f"{split['name']}\t{len(fold_split['val_labels'])}\t{len(fold_split['test_labels'])}")
     print()
 
-    # Greedy PC selection per target
     all_results = []
     for split in target_splits:
         fold_results = []
@@ -321,11 +232,10 @@ def main() -> None:
             print(f"target={split['name']}  fold={fold_split['fold']}")
             print(f"selected_pcs={','.join(pc_labels) if pc_labels else 'none'}")
             print(f"control_selected_pcs={','.join(control_pc_labels) if control_pc_labels else 'none'}")
-            print(
-                f"best_target_{selection_label(args.selection_scope)}_auroc={best_val_auroc:.6f}"
-                if best_val_auroc is not None else
-                f"best_target_{selection_label(args.selection_scope)}_auroc=nan"
-            )
+            if best_val_auroc is None:
+                print(f"best_target_{selection_label(args.selection_scope)}_auroc=nan")
+            else:
+                print(f"best_target_{selection_label(args.selection_scope)}_auroc={best_val_auroc:.6f}")
             print(f"selection_n={len(selection_labels)}")
 
             print(f"step\tselected_pc\t{selection_label(args.selection_scope)}_auroc")
@@ -347,11 +257,7 @@ def main() -> None:
                 "selected_k": len(selected_pcs),
                 "control_selected_pcs": control_pc_labels,
                 "history": [
-                    {
-                        "step": i + 1,
-                        "pc": f"PC{pc + 1}",
-                        "selection_auroc": score,
-                    }
+                    {"step": i + 1, "pc": f"PC{pc + 1}", "selection_auroc": score}
                     for i, (pc, score) in enumerate(history)
                 ],
                 "best_selection_auroc": best_val_auroc,
@@ -362,7 +268,10 @@ def main() -> None:
 
         mean_greedy_test_auroc = float(np.nanmean(greedy_fold_aurocs))
         mean_control_test_auroc = float(np.nanmean(control_fold_aurocs))
-        print(f"target={split['name']}  mean_greedy_test_auroc={mean_greedy_test_auroc:.6f}  mean_control_test_auroc={mean_control_test_auroc:.6f}\n")
+        print(
+            f"target={split['name']}  mean_greedy_test_auroc={mean_greedy_test_auroc:.6f}  "
+            f"mean_control_test_auroc={mean_control_test_auroc:.6f}\n"
+        )
 
         if args.cv_folds > 1:
             all_results.append({
@@ -379,7 +288,7 @@ def main() -> None:
                 "target": split["name"],
                 "val_n": fold_result["val_n"],
                 "test_n": fold_result["test_n"],
-                "selection_scope": args.selection_scope,
+                "selection_scope": fold_result["selection_scope"],
                 "selection_n": fold_result["selection_n"],
                 "selected_pcs": fold_result["selected_pcs"],
                 "selected_k": fold_result["selected_k"],
@@ -395,20 +304,29 @@ def main() -> None:
         output = {
             "source": args.source,
             "targets": target_names,
+            "layer": args.layer,
             "pooling": args.pooling,
             "c": args.c,
             "seed": args.seed,
             "target_val_size": args.target_val_size,
             "cv_folds": args.cv_folds,
             "selection_scope": args.selection_scope,
+            "selection_scope_note": (
+                "full_target uses all target labels for PC selection and should be treated as an oracle/upper-bound setting."
+                if args.selection_scope == "full_target"
+                else "fold_val selects PCs only on the validation split/fold."
+            ),
             "improvement_threshold": args.improvement_threshold,
             "source_n": len(source_labels),
             "max_pcs": max_usable_pcs,
             "results": all_results,
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(output, indent=2))
+        args.output.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        raise SystemExit(f"error: {exc}")
