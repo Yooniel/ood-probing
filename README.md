@@ -114,6 +114,3 @@ python scripts/interpret_ood_score.py \
   --openai-model gpt-5-mini \
   --output interp/roleplaying_pc1_interp.json
 ```
-
-If multiple activation layers are present for a dataset, pass `--layer N` to
-the scripts so the loader does not guess.
