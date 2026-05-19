@@ -2,6 +2,12 @@
 
 OOD deception probes via subspaces.
 
+![Figure 1](img/Figure1.png "Figure 1: short description")
+
+- Small transferable subspace exists 
+- Source/target rankings fail to recover it
+- LLM judge partially recovers the subspace
+
 ## Setup
 
 Install the Python dependencies:
