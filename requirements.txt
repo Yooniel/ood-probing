@@ -1,4 +1,5 @@
 numpy
 scikit-learn
+torch
 transformers
 huggingface_hub

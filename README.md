@@ -1,4 +1,4 @@
-# AISC11
+# AISC 11
 
 OOD deception probes via subspaces.
 
@@ -30,9 +30,9 @@ huggingface-cli download Yooniel/deception-activations \
   --local-dir data/deception-activations
 ```
 
-Generated roleplaying interpretation results are available at:
+Generated roleplaying interpretation results are available on [Huggingface](https://huggingface.co/datasets/Yooniel/roleplaying-interp):
 
-https://huggingface.co/datasets/Yooniel/roleplaying-interp
+
 
 ## Scripts
 
@@ -114,3 +114,6 @@ python scripts/interpret_ood_score.py \
   --openai-model gpt-5-mini \
   --output interp/roleplaying_pc1_interp.json
 ```
+
+## Acknowledgements
+This codebase builds on [Detecting Strategic Deception Using Linear Probes](https://github.com/ApolloResearch/deception-detection) and [The Truthfulness Spectrum Hypothesis](https://github.com/zfying/truth_spec)
